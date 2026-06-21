@@ -61,7 +61,15 @@ class StreamConverter:
         # Native OpenAI tool_calls accumulator (streaming)
         self._native_tool_calls: dict[int, dict[str, Any]] = {}  # index → {id, name, arguments}
 
+        # Captured upstream usage from final streaming chunk
+        self._usage: dict[str, Any] | None = None
+
     def feed(self, chunk: dict[str, Any]) -> Iterator[bytes]:
+        # Capture usage from chunk (present in the final chunk when include_usage=true)
+        usage = chunk.get("usage")
+        if isinstance(usage, dict) and usage:
+            self._usage = usage
+
         choices = chunk.get("choices") or []
         if not choices:
             return
@@ -207,10 +215,13 @@ class StreamConverter:
         stop_reason = _STOP_REASON_MAP.get(self._finish_reason or "stop", "end_turn")
         if self._has_tool_use and stop_reason == "end_turn":
             stop_reason = "tool_use"
+        output_tokens = 0
+        if self._usage:
+            output_tokens = int(self._usage.get("completion_tokens", 0) or 0)
         return sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": 0},
+            "usage": {"output_tokens": output_tokens},
         })
 
     def _emit_message_stop(self) -> bytes:
