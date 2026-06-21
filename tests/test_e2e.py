@@ -71,9 +71,21 @@ def sample_request() -> dict:
         "model": "DeepSeek-V4-Pro",
         "max_tokens": 100,
         "messages": [
-            {"role": "user", "content": f"Reply with only the word OK. ({uuid.uuid4().hex[:6]})"}
+            {"role": "user", "content": f"Reply with only the word OK. ({_cache_tag()})"}
         ],
     }
+
+
+def _cache_tag() -> str:
+    """Random short tag to bust upstream's aggressive semantic cache.
+
+    HKUST upstream caches by prompt content; without a unique marker each
+    test run hits the same cache key. If a prior run cached a bad/empty
+    response (e.g. transient upstream error), every subsequent run returns
+    that stale entry — observed as ~1ms response times with 0 content.
+    Probe-verified 2026-06-21.
+    """
+    return uuid.uuid4().hex[:8]
 
 
 # --- non-streaming ---
@@ -98,7 +110,7 @@ async def test_nonstream_with_system(client):
         "model": "DeepSeek-V4-Pro",
         "max_tokens": 50,
         "system": "You are a parrot. Reply with exactly what the user says, nothing else.",
-        "messages": [{"role": "user", "content": "banana"}],
+        "messages": [{"role": "user", "content": f"banana {_cache_tag()}"}],
     })
     assert resp.status_code == 200
     text_blocks = [b for b in resp.json()["content"] if b["type"] == "text"]
@@ -112,7 +124,7 @@ async def test_nonstream_tool_use(client):
         "model": "DeepSeek-V4-Pro",
         "max_tokens": 500,
         "messages": [
-            {"role": "user", "content": "What's the weather in Tokyo? Use the get_weather tool."}
+            {"role": "user", "content": f"What's the weather in Tokyo? Use the get_weather tool. [tag:{_cache_tag()}]"}
         ],
         "tools": [{
             "name": "get_weather",
@@ -143,7 +155,7 @@ async def test_stream_basic_text(client):
         "model": "DeepSeek-V4-Pro",
         "max_tokens": 50,
         "stream": True,
-        "messages": [{"role": "user", "content": "Say hello in one word."}],
+        "messages": [{"role": "user", "content": f"Say hello in one word. [tag:{_cache_tag()}]"}],
     })
     assert resp.status_code == 200
     assert "text/event-stream" in resp.headers["content-type"]
@@ -166,7 +178,7 @@ async def test_stream_emits_text_deltas(client):
         "model": "DeepSeek-V4-Pro",
         "max_tokens": 50,
         "stream": True,
-        "messages": [{"role": "user", "content": "Count from 1 to 3."}],
+        "messages": [{"role": "user", "content": f"Count from 1 to 3. [tag:{_cache_tag()}]"}],
     })
     events = _parse_sse_stream(resp)
     text_deltas = [
@@ -186,7 +198,7 @@ async def test_stream_tool_use(client):
         "max_tokens": 500,
         "stream": True,
         "messages": [
-            {"role": "user", "content": "What's the weather in Paris? Use the get_weather tool."}
+            {"role": "user", "content": f"What's the weather in Paris? Use the get_weather tool. [tag:{_cache_tag()}]"}
         ],
         "tools": [{
             "name": "get_weather",
@@ -221,11 +233,15 @@ async def test_health_endpoint(client):
 
 async def test_multi_turn_with_tool_result(client):
     """Full tool round-trip: model calls tool → user sends tool_result → model answers."""
+    # Single tag for the whole conversation so round 2 replays round 1 verbatim.
+    tag = _cache_tag()
+    round1_prompt = f"What's the weather in Berlin? Use the tool. [tag:{tag}]"
+
     # Round 1: model emits tool_use
     resp1 = await client.post("/v1/messages", json={
         "model": "DeepSeek-V4-Pro",
         "max_tokens": 500,
-        "messages": [{"role": "user", "content": "What's the weather in Berlin? Use the tool."}],
+        "messages": [{"role": "user", "content": round1_prompt}],
         "tools": [{
             "name": "get_weather",
             "description": "Get current weather for a city",
@@ -239,7 +255,7 @@ async def test_multi_turn_with_tool_result(client):
     })
     data1 = resp1.json()
     tool_uses = [b for b in data1["content"] if b["type"] == "tool_use"]
-    assert tool_uses
+    assert tool_uses, f"round 1 produced no tool_use; full content: {data1.get('content')}"
     tool_use_id = tool_uses[0]["id"]
 
     # Round 2: send the tool_result back
@@ -247,7 +263,7 @@ async def test_multi_turn_with_tool_result(client):
         "model": "DeepSeek-V4-Pro",
         "max_tokens": 500,
         "messages": [
-            {"role": "user", "content": "What's the weather in Berlin? Use the tool."},
+            {"role": "user", "content": round1_prompt},
             {"role": "assistant", "content": data1["content"]},
             {"role": "user", "content": [{
                 "type": "tool_result",
@@ -270,7 +286,8 @@ async def test_multi_turn_with_tool_result(client):
     text_blocks = [b for b in data2["content"] if b["type"] == "text"]
     combined = "".join(b["text"] for b in text_blocks).lower()
     # The model should incorporate the tool result
-    assert any(token in combined for token in ["sunny", "22", "berlin", "weather"])
+    assert any(token in combined for token in ["sunny", "22", "berlin", "weather"]), \
+        f"round 2 didn't incorporate tool result; combined={combined!r}"
 
 
 # --- helpers ---
