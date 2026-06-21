@@ -16,6 +16,7 @@ env/
 .idea/
 .vscode/
 .claude/
+.serena/
 
 # Secrets
 .env
