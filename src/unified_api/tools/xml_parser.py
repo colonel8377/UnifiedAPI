@@ -81,7 +81,7 @@ def parse_complete(text: str) -> list[TextSegment | ToolUseSegment]:
         if not close_m:
             # Block never closes — treat the partial block as text so the
             # client sees what the model produced rather than losing it.
-            logger.warning("Unclosed <function_calls> block; emitting as text")
+            logger.debug("Unclosed <function_calls> block; emitting as text")
             segments.append(TextSegment(text=text[open_m.start():]))
             break
         xml_chunk = text[open_m.start():close_m.end()]
@@ -98,7 +98,7 @@ def _parse_invokes_from_xml(xml_text: str) -> list[ParsedInvoke]:
         # ElementTree is strict; the model usually emits clean XML so this works.
         root = ET.fromstring(xml_text)
     except ET.ParseError as e:
-        logger.warning("ElementTree parse failed (%s); falling back to regex", e)
+        logger.debug("ElementTree parse failed (%s); falling back to regex", e)
         return _parse_invokes_regex(xml_text)
 
     if root.tag.lower() != "function_calls":
@@ -232,7 +232,7 @@ class IncrementalXmlScanner:
                     yield ToolUseSegment(name=inv.name, params=inv.params)
             else:
                 # Unclosed and unparseable — preserve as text
-                logger.warning("Unclosed <function_calls> at flush; emitting as text")
+                logger.debug("Unclosed <function_calls> at flush; emitting as text")
                 yield TextSegment(text=partial)
         else:
             yield TextSegment(text=self._buffer)

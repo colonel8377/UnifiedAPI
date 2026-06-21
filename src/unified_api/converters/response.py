@@ -10,6 +10,7 @@ Full v1 conversion:
 """
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from typing import Any
@@ -67,6 +68,12 @@ def convert_response(
                 "input": seg.params,
             })
             has_tool_use = True
+
+    # Native OpenAI tool_calls (upstream supports tool calling natively)
+    native_tools = _extract_tool_calls(oai_resp)
+    for tc in native_tools:
+        content_blocks.append(tc)
+        has_tool_use = True
 
     if not content_blocks:
         content_blocks.append({"type": "text", "text": ""})
@@ -142,3 +149,41 @@ def _extract_usage(resp: OpenAIChatResponse) -> AnthropicUsage:
         input_tokens=int(usage.get("prompt_tokens", 0) or 0),
         output_tokens=int(usage.get("completion_tokens", 0) or 0),
     )
+
+
+def _extract_tool_calls(resp: OpenAIChatResponse) -> list[dict[str, Any]]:
+    """Extract native OpenAI tool_calls from the response message."""
+    if not resp.choices:
+        return []
+    choice = resp.choices[0]
+    if not isinstance(choice, dict):
+        return []
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return []
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function")
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        raw_args = fn.get("arguments", "{}")
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+        tc_id = tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
+        result.append({
+            "type": "tool_use",
+            "id": tc_id,
+            "name": name,
+            "input": args if isinstance(args, dict) else {},
+        })
+    return result

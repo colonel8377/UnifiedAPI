@@ -58,6 +58,9 @@ class StreamConverter:
         self._think_splitter = IncrementalThinkSplitter()
         self._xml_scanner = IncrementalXmlScanner()
 
+        # Native OpenAI tool_calls accumulator (streaming)
+        self._native_tool_calls: dict[int, dict[str, Any]] = {}  # index → {id, name, arguments}
+
     def feed(self, chunk: dict[str, Any]) -> Iterator[bytes]:
         choices = chunk.get("choices") or []
         if not choices:
@@ -86,10 +89,18 @@ class StreamConverter:
         if isinstance(content, str) and content:
             yield from self._process_content(content)
 
+        # 3. Native OpenAI tool_calls (streaming)
+        tool_calls = delta.get("tool_calls")
+        if isinstance(tool_calls, list):
+            yield from self._accumulate_native_tool_calls(tool_calls)
+
         if isinstance(finish_reason, str) and finish_reason:
             self._finish_reason = finish_reason
 
     def flush(self) -> Iterator[bytes]:
+        # Emit any accumulated native OpenAI tool_calls first
+        yield from self._emit_accumulated_tool_calls()
+
         # Drain scanners (in case there's buffered text at EOF)
         for seg in self._think_splitter.flush():
             yield from self._emit_think_segment(seg.kind, seg.text)
@@ -136,31 +147,6 @@ class StreamConverter:
                 })
         elif isinstance(seg, ToolUseSegment):
             yield from self._emit_tool_use_block(seg.name, seg.params)
-
-    def _emit_tool_use_block(self, name: str, params: dict[str, Any]) -> Iterator[bytes]:
-        # Close any open block first (text or thinking)
-        if self._current_block is not None:
-            yield self._close_current_block_event()
-        index = self._next_index
-        self._next_index += 1
-        tool_id = f"toolu_{uuid.uuid4().hex[:24]}"
-        yield sse("content_block_start", {
-            "type": "content_block_start",
-            "index": index,
-            "content_block": {"type": "tool_use", "id": tool_id, "name": name, "input": {}},
-        })
-        # Emit the input JSON as a single input_json_delta chunk.
-        # (Streaming input incrementally would be nicer UX but adds parser
-        # complexity; v1 emits the whole JSON at once.)
-        partial_json = json.dumps(params, ensure_ascii=False)
-        yield sse("content_block_delta", {
-            "type": "content_block_delta",
-            "index": index,
-            "delta": {"type": "input_json_delta", "partial_json": partial_json},
-        })
-        yield sse("content_block_stop", {"type": "content_block_stop", "index": index})
-        self._has_tool_use = True
-        # No current_block set — next text/thinking will open a new block.
 
     def _ensure_block(self, block_type: str) -> Iterator[bytes]:
         if self._current_block == block_type:
@@ -229,3 +215,67 @@ class StreamConverter:
 
     def _emit_message_stop(self) -> bytes:
         return sse("message_stop", {"type": "message_stop"})
+
+    # --- Native OpenAI tool_calls handling ---
+
+    def _accumulate_native_tool_calls(self, tool_calls: list[dict[str, Any]]) -> Iterator[bytes]:
+        """Accumulate streaming tool_call deltas. Emit tool_use blocks when
+        a new tool call starts (we get its name)."""
+        for tc_delta in tool_calls:
+            if not isinstance(tc_delta, dict):
+                continue
+            idx = tc_delta.get("index", 0)
+            if idx not in self._native_tool_calls:
+                self._native_tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
+            entry = self._native_tool_calls[idx]
+            # id comes in the first chunk for this index
+            tc_id = tc_delta.get("id")
+            if isinstance(tc_id, str) and tc_id:
+                entry["id"] = tc_id
+            # function name + arguments
+            fn = tc_delta.get("function")
+            if isinstance(fn, dict):
+                name = fn.get("name")
+                if isinstance(name, str) and name:
+                    entry["name"] = name
+                args_chunk = fn.get("arguments")
+                if isinstance(args_chunk, str):
+                    entry["arguments"] += args_chunk
+
+    def _emit_accumulated_tool_calls(self) -> Iterator[bytes]:
+        """Emit all accumulated native tool calls as tool_use blocks."""
+        for idx in sorted(self._native_tool_calls.keys()):
+            entry = self._native_tool_calls[idx]
+            name = entry.get("name")
+            if not name:
+                continue
+            raw_args = entry.get("arguments", "{}")
+            try:
+                args = json.loads(raw_args) if raw_args else {}
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            tc_id = entry.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
+            yield from self._emit_tool_use_block(name, args if isinstance(args, dict) else {}, tc_id)
+
+    def _emit_tool_use_block(
+        self, name: str, params: dict[str, Any], tool_id: str | None = None
+    ) -> Iterator[bytes]:
+        # Close any open block first (text or thinking)
+        if self._current_block is not None:
+            yield self._close_current_block_event()
+        index = self._next_index
+        self._next_index += 1
+        tid = tool_id or f"toolu_{uuid.uuid4().hex[:24]}"
+        yield sse("content_block_start", {
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "tool_use", "id": tid, "name": name, "input": {}},
+        })
+        partial_json = json.dumps(params, ensure_ascii=False)
+        yield sse("content_block_delta", {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "input_json_delta", "partial_json": partial_json},
+        })
+        yield sse("content_block_stop", {"type": "content_block_stop", "index": index})
+        self._has_tool_use = True
