@@ -109,7 +109,6 @@ class UpstreamClient:
         """
         payload = request.model_dump(exclude_none=True)
         payload["stream"] = True
-        payload["stream_options"] = {"include_usage": True}
         try:
             async with self.client.stream(
                 "POST", "/chat/completions", json=payload, headers=self._auth_headers()
