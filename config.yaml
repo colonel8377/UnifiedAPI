@@ -1,0 +1,35 @@
+server:
+  host: 0.0.0.0
+  port: 8000
+
+upstream:
+  base_url: ${OPENAI_BASE_URL}
+  api_keys:
+    - ${OPENAI_KEY_1}
+    - ${OPENAI_KEY_2}
+  timeout_seconds: 300
+
+auth:
+  password: ${AUTH_PASSWORD}
+
+limits:
+  global_concurrency: 10
+  global_rpm: 60
+  per_client_concurrency: 5
+  per_client_rpm: 30
+  queue_max_size: 100
+
+retry:
+  max_attempts: 3
+  base_backoff_ms: 500
+  max_backoff_ms: 10000
+  retry_on_status: [429, 500, 502, 503, 504]
+  retry_on_network: true
+  retry_stream_midway: false
+
+thinking:
+  return_by_default: false
+  return_when_client_enables: true
+
+logging:
+  level: INFO
