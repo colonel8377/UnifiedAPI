@@ -98,6 +98,9 @@ async def _nonstream_response(
         raise AnthropicError(503, "overloaded_error", f"Cannot reach upstream: {e}") from e
     except UpstreamError as e:
         raise AnthropicError(502, "api_error", str(e)) from e
+    except Exception as e:
+        logger.error("Unexpected error in non-streaming messages: %s", e, exc_info=True)
+        raise AnthropicError(500, "api_error", f"Internal server error: {e}") from e
 
     _ = config  # reserved for future per-request hooks
     anthropic_response = convert_response(oai_response, alias, return_thinking)
@@ -161,6 +164,9 @@ async def _stream_response(
             raise AnthropicError(503, "overloaded_error", f"Cannot reach upstream: {e}") from e
         except UpstreamError as e:
             raise AnthropicError(502, "api_error", str(e)) from e
+        except Exception as e:
+            logger.error("Unexpected error during stream init: %s", e, exc_info=True)
+            raise AnthropicError(500, "api_error", f"Internal server error: {e}") from e
     except AnthropicError:
         # Clean up admission slot before propagating
         await admission_ctx.__aexit__(None, None, None)
@@ -184,8 +190,21 @@ async def _stream_response(
                         "error": {"type": "api_error", "message": f"Upstream stream error: {e}"},
                     })
                     return
+                except Exception as e:
+                    logger.error("Unexpected error mid-stream: %s", e, exc_info=True)
+                    yield sse("error", {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": f"Internal error during streaming: {e}"},
+                    })
+                    return
             for ev in converter.flush():
                 yield ev
+        except Exception as e:
+            logger.error("Fatal error in stream event_gen: %s", e, exc_info=True)
+            yield sse("error", {
+                "type": "error",
+                "error": {"type": "api_error", "message": f"Internal server error: {e}"},
+            })
         finally:
             await admission_ctx.__aexit__(None, None, None)
 

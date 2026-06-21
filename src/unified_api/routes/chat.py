@@ -86,6 +86,9 @@ async def _nonstream_response(
         return _openai_error(503, "server_error", f"Cannot reach upstream: {e}")
     except UpstreamError as e:
         return _openai_error(502, "server_error", str(e))
+    except Exception as e:
+        logger.error("Unexpected error in non-streaming chat: %s", e, exc_info=True)
+        return _openai_error(500, "internal_error", f"Internal server error: {e}")
 
     return JSONResponse(content=_postprocess_tool_calls(oai_response.model_dump()))
 
@@ -152,6 +155,10 @@ async def _stream_response(
         except UpstreamError as e:
             await admission_ctx.__aexit__(None, None, None)
             return _openai_error(502, "server_error", str(e))
+        except Exception as e:
+            logger.error("Unexpected error during stream init: %s", e, exc_info=True)
+            await admission_ctx.__aexit__(None, None, None)
+            return _openai_error(500, "internal_error", f"Internal server error: {e}")
     except Exception:
         await admission_ctx.__aexit__(None, None, None)
         raise
@@ -205,6 +212,11 @@ async def _stream_response(
         except UpstreamError as e:
             logger.warning("Upstream error mid-stream: %s", e)
             yield _oai_sse_error(f"Upstream stream error: {e}")
+            yield b"data: [DONE]\n\n"
+        except Exception as e:
+            logger.error("Unexpected error mid-stream: %s", e, exc_info=True)
+            yield _oai_sse_error(f"Internal server error: {e}")
+            yield b"data: [DONE]\n\n"
         finally:
             await admission_ctx.__aexit__(None, None, None)
 

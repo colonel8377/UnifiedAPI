@@ -13,11 +13,11 @@ auth:
   password: ${AUTH_PASSWORD}
 
 limits:
-  global_concurrency: 10
-  global_rpm: 60
-  per_client_concurrency: 5
-  per_client_rpm: 30
-  queue_max_size: 100
+  global_concurrency: 50
+  global_rpm: 300
+  per_client_concurrency: 20
+  per_client_rpm: 120
+  queue_max_size: 200
 
 retry:
   max_attempts: 3

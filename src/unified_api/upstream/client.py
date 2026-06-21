@@ -50,6 +50,11 @@ class UpstreamClient:
         self._client = httpx.AsyncClient(
             base_url=self._config.base_url,
             timeout=httpx.Timeout(self._config.timeout_seconds, connect=10.0),
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=50,
+                keepalive_expiry=30,
+            ),
             headers={"Content-Type": "application/json"},
         )
 
