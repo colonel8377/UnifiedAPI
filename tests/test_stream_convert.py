@@ -408,3 +408,101 @@ def test_no_choices_key_chunk_skipped():
         if t == "content_block_delta" and e["delta"].get("type") == "text_delta"
     ]
     assert "".join(text_deltas) == "ok"
+
+
+# --- length + no visible content → sentinel (the "stops for no reason" fix) ---
+# Bug pattern: DeepSeek-V4-Pro can consume the entire upstream max_tokens
+# budget on reasoning_content, yielding finish_reason='length' with ZERO
+# visible content. Without the sentinel the client sees an empty assistant
+# message + stop_reason=max_tokens and silently ends the turn.
+
+
+def test_length_no_content_emits_sentinel():
+    """Core fix: finish=length + no visible content → inject sentinel
+    text_delta so the client never sees an empty assistant message."""
+    converter = StreamConverter(requested_model_alias="m", return_thinking=False)
+    # Bug pattern: only reasoning_content (dropped because return_thinking=False),
+    # then length
+    events = _drain(converter, [
+        _chunk(reasoning="thinking hard"),
+        _chunk(reasoning="...still thinking"),
+        _chunk(finish="length"),
+    ])
+    text_deltas = [
+        e["delta"]["text"]
+        for t, e in events
+        if t == "content_block_delta" and e["delta"].get("type") == "text_delta"
+    ]
+    combined = "".join(text_deltas)
+    assert "UnifiedAPI warning" in combined
+    assert "max_tokens" in combined
+    # stop_reason stays max_tokens — honest about what happened
+    delta_data = next(e for t, e in events if t == "message_delta")
+    assert delta_data["delta"]["stop_reason"] == "max_tokens"
+
+
+def test_length_with_content_does_not_emit_sentinel():
+    """Real content was produced before hitting length → no sentinel."""
+    converter = StreamConverter(requested_model_alias="m", return_thinking=False)
+    events = _drain(converter, [
+        _chunk(content="partial answer"),
+        _chunk(finish="length"),
+    ])
+    text_deltas = [
+        e["delta"]["text"]
+        for t, e in events
+        if t == "content_block_delta" and e["delta"].get("type") == "text_delta"
+    ]
+    combined = "".join(text_deltas)
+    assert "partial answer" in combined
+    assert "UnifiedAPI warning" not in combined
+
+
+def test_length_thinking_only_still_emits_sentinel():
+    """Thinking blocks don't count as visible content even when forwarded."""
+    converter = StreamConverter(requested_model_alias="m", return_thinking=True)
+    events = _drain(converter, [
+        _chunk(reasoning="deep thoughts"),
+        _chunk(finish="length"),
+    ])
+    text_deltas = [
+        e["delta"]["text"]
+        for t, e in events
+        if t == "content_block_delta" and e["delta"].get("type") == "text_delta"
+    ]
+    combined = "".join(text_deltas)
+    assert "UnifiedAPI warning" in combined
+
+
+def test_length_with_tool_use_does_not_emit_sentinel():
+    """Tool use counts as visible content; no sentinel needed."""
+    converter = StreamConverter(requested_model_alias="m", return_thinking=False)
+    xml = (
+        '<function_calls><invoke name="f">'
+        '<parameter name="x">1</parameter>'
+        '</invoke></function_calls>'
+    )
+    events = _drain(converter, [
+        _chunk(content=xml),
+        _chunk(finish="length"),
+    ])
+    text_deltas = [
+        e["delta"]["text"]
+        for t, e in events
+        if t == "content_block_delta" and e["delta"].get("type") == "text_delta"
+    ]
+    combined = "".join(text_deltas)
+    assert "UnifiedAPI warning" not in combined
+
+
+def test_stop_no_content_does_not_emit_sentinel():
+    """finish=stop with no content is suspicious but NOT the bug we're fixing;
+    sentinel only fires on length. Avoids masking other issues."""
+    converter = StreamConverter(requested_model_alias="m", return_thinking=False)
+    events = _drain(converter, [_chunk(finish="stop")])
+    text_deltas = [
+        e["delta"]["text"]
+        for t, e in events
+        if t == "content_block_delta" and e["delta"].get("type") == "text_delta"
+    ]
+    assert text_deltas == []

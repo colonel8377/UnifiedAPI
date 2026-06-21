@@ -42,7 +42,51 @@ def test_basic_user_message():
     assert len(oai.messages) == 1
     assert oai.messages[0]["role"] == "user"
     assert oai.messages[0]["content"] == "hello"
-    assert oai.max_tokens == 2148  # 100 + 2048 reasoning buffer
+    # Buffer = max(int(max_tokens * 1.5), 16384); with max_tokens=100 the
+    # floor kicks in → 16384 (reasoning_content eats the upstream budget).
+    assert oai.max_tokens == 16384
+
+
+def test_reasoning_buffer_scales_above_floor():
+    """Above the 16384 floor, buffer scales as max_tokens + 8192."""
+    req = _make_req(max_tokens=16384)
+    oai = convert_request(req, UPSTREAM_MODEL)
+    assert oai.max_tokens == 24576  # 16384 + 8192
+
+
+def test_max_tokens_capped_by_upstream_context_window():
+    """Claude Code sends 32000 max_tokens + ~30k tokens of input (large system
+    prompt + many tools). Old formula (max_tokens * 1.5 = 48000) overflowed
+    upstream's 65535-token context → empty SSE body. New formula must cap
+    below what fits, never above 65535 - input_estimate.
+    """
+    big_system = "x" * 85_000          # ~28k tokens, simulating Claude Code's
+    many_tools = [
+        {"name": f"tool_{i}", "description": "d" * 200,
+         "input_schema": {"type": "object", "properties": {"p": {"type": "string"}}}}
+        for i in range(48)
+    ]
+    req = _make_req(
+        max_tokens=32000,
+        system=big_system,
+        tools=many_tools,
+    )
+    oai = convert_request(req, UPSTREAM_MODEL)
+    # Must be capped: well below the 40192 that the old formula would produce
+    assert oai.max_tokens < 32_000 + 8192
+    # Must still be above the 16384 floor (input is large but not so large that
+    # even the floor doesn't fit)
+    assert oai.max_tokens >= 16384
+    # Must fit within upstream context window when combined with input estimate
+    # (input_chars / 3 + max_tokens < 65535)
+    assert oai.max_tokens < 65535
+
+
+def test_max_tokens_floor_respected_for_tiny_input():
+    """Small request still gets the 16384 floor."""
+    req = _make_req(max_tokens=100, messages=[{"role": "user", "content": "hi"}])
+    oai = convert_request(req, UPSTREAM_MODEL)
+    assert oai.max_tokens == 16384
 
 
 def test_model_passthrough():

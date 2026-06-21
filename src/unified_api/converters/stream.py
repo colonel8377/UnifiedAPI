@@ -34,6 +34,19 @@ _STOP_REASON_MAP = {
 }
 
 
+# Emitted when upstream returns finish_reason='length' but the stream produced
+# no visible content (i.e. reasoning_content ate the entire max_tokens budget).
+# Without this sentinel the client sees an empty assistant message +
+# stop_reason=max_tokens and silently ends the turn — the "stops for no
+# apparent reason" bug. Probe-measured on DeepSeek-V4-Pro (2026-06-21):
+# a math prompt made the model think for 487s and consume all 16384 upstream
+# tokens in reasoning_content, yielding 0 visible chars.
+_LENGTH_NO_CONTENT_SENTINEL = (
+    "[UnifiedAPI warning] upstream hit max_tokens during reasoning_content; "
+    "no visible content was produced. Please retry the request."
+)
+
+
 def sse(event_type: str, data: dict[str, Any]) -> bytes:
     """Format one Anthropic-style SSE event."""
     payload = json.dumps(data, ensure_ascii=False)
@@ -53,6 +66,10 @@ class StreamConverter:
         self._current_block: str | None = None  # "thinking" | "text"
         self._finish_reason: str | None = None
         self._has_tool_use = False
+        # Tracks whether any user-visible content (text or tool_use) was
+        # emitted. Thinking blocks don't count — they're invisible to the
+        # client when return_thinking=False.
+        self._has_visible_content = False
 
         # Incremental scanners for content (the visible `delta.content` field)
         self._think_splitter = IncrementalThinkSplitter()
@@ -115,6 +132,18 @@ class StreamConverter:
         for seg in self._xml_scanner.flush():
             yield from self._emit_xml_segment(seg)
 
+        # Sentinel: upstream exhausted max_tokens on reasoning_content with
+        # no visible text/tool_use emitted. Without this the client sees an
+        # empty assistant message + stop_reason=max_tokens and silently ends
+        # the turn (the original "stops for no reason" bug).
+        if self._finish_reason == "length" and not self._has_visible_content:
+            yield from self._ensure_block("text")
+            yield sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": self._next_index - 1,
+                "delta": {"type": "text_delta", "text": _LENGTH_NO_CONTENT_SENTINEL},
+            })
+
         if not self._started:
             yield self._emit_message_start()
         yield from self._close_current_block()
@@ -147,6 +176,7 @@ class StreamConverter:
         if isinstance(seg, TextSegment):
             text = seg.text
             if text:
+                self._has_visible_content = True
                 yield from self._ensure_block("text")
                 yield sse("content_block_delta", {
                     "type": "content_block_delta",
@@ -290,3 +320,4 @@ class StreamConverter:
         })
         yield sse("content_block_stop", {"type": "content_block_stop", "index": index})
         self._has_tool_use = True
+        self._has_visible_content = True

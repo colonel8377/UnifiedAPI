@@ -13,6 +13,7 @@ Full v1 conversion:
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -53,11 +54,38 @@ def convert_request(
         content = msg.get("content")
         openai_messages.append({"role": role, "content": _flatten_content(content, idx, role)})
 
-    # DeepSeek reasoning tokens share the max_tokens budget with content.
-    # Anthropic's max_tokens only counts visible output (thinking has a separate
-    # budget). Add a buffer to ensure enough tokens for content after reasoning.
-    _REASONING_BUFFER = 2048
-    upstream_max_tokens = (anth_req.max_tokens or 0) + _REASONING_BUFFER
+    # DeepSeek reasoning_content shares the upstream max_tokens budget with
+    # visible content (probe-verified 2026-06-21: a moderate math prompt can
+    # consume the entire upstream budget on reasoning_content alone, yielding
+    # 0 visible chars + finish_reason='length'). We add a buffer so the model
+    # has room to think AND emit visible content.
+    #
+    # But the upstream context window is hard-capped at 65535 tokens
+    # (litellm max_total_tokens). Claude Code sends max_tokens=32000 with
+    # ~28k-char system prompt + 48 tools (Anthropic+XML-injected+OpenAI-format
+    # ≈ 85k chars ≈ 30k tokens of input). Old formula (max_tokens * 1.5 = 48000)
+    # + ~30k input = ~78k → overflows → upstream silently returns HTTP 200
+    # with empty SSE body. Debug instrumentation confirmed this pattern
+    # (/tmp/uapi_debug.jsonl: 4 consecutive requests with 0 chunks, 0 chars).
+    #
+    # Strategy: estimate input tokens from payload size, reserve headroom
+    # within the 65535 cap, then take the smaller of (user_request + buffer)
+    # vs (what fits), floored at 16384 (probe-verified minimum to keep
+    # reasoning_content from eating the entire budget on small prompts).
+    _REASONING_BUFFER = 8192          # probe-observed worst case (~2x margin)
+    _UPSTREAM_CONTEXT = 65535         # litellm max_total_tokens
+    _SAFETY_MARGIN = 2048             # tokenizer estimate slack
+    _MIN_OUTPUT = 16384               # floor; below this, sentinel fires too often
+
+    input_chars = sum(len(m.get("content") or "") for m in openai_messages)
+    if anth_req.tools:
+        # Account for tools array sent in OpenAI format alongside the XML prompt
+        input_chars += len(json.dumps(_convert_tools_to_openai(anth_req.tools)))
+    input_tokens_est = input_chars // 3   # ~3 chars/token for mixed JSON/text
+    context_budget = _UPSTREAM_CONTEXT - input_tokens_est - _SAFETY_MARGIN
+
+    desired = (anth_req.max_tokens or 0) + _REASONING_BUFFER
+    upstream_max_tokens = max(_MIN_OUTPUT, min(desired, context_budget))
 
     payload: dict[str, Any] = {
         "model": model_name,

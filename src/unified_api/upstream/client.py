@@ -114,8 +114,16 @@ class UpstreamClient:
         """
         payload = request.model_dump(exclude_none=True)
         payload["stream"] = True
-        # Request usage from upstream (silently ignored if unsupported)
-        payload["stream_options"] = {"include_usage": True}
+        # NOTE: do NOT inject stream_options={"include_usage": true} here.
+        # Probe measurement (2026-06-21) on HKUST DeepSeek-V4-Pro showed:
+        #   1. Usage is never actually returned (always None) — the field is
+        #      silently ignored, not honored.
+        #   2. Worse, presence of stream_options flips the upstream onto a
+        #      semantic-cache fast path: identical prompts return in ~0.2s
+        #      as 1-2 mega-chunks instead of the normal streamed sequence.
+        # The previous `feat: request stream usage from upstream` commit
+        # assumed graceful fallback; that assumption was never tested against
+        # this upstream and does not hold.
         try:
             async with self.client.stream(
                 "POST", "/chat/completions", json=payload, headers=self._auth_headers()
