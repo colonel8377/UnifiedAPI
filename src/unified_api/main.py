@@ -3,25 +3,48 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
-from .config import KeyPool, get_config
+from .config import KeyPool, get_config, PROJECT_ROOT
 from .control.concurrency import AdmissionControl
 from .control.rate_limiter import RateLimiter
 from .errors import AnthropicError
 from .routes import chat, messages
 from .upstream.client import UpstreamClient
 
+_LOG_DIR = PROJECT_ROOT / "log"
+
 
 def _configure_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    fmt = "%(asctime)s %(levelname)s %(name)s - %(message)s"
+
+    # Ensure log directory exists
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+
+    # Console handler
+    console = logging.StreamHandler()
+    console.setLevel(log_level)
+    console.setFormatter(logging.Formatter(fmt))
+    root_logger.addHandler(console)
+
+    # Rotating file handler: 10MB per file, keep 5 backups
+    log_file = _LOG_DIR / "unified_api.log"
+    file_handler = RotatingFileHandler(
+        log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(logging.Formatter(fmt))
+    root_logger.addHandler(file_handler)
 
 
 @asynccontextmanager

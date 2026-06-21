@@ -136,8 +136,8 @@ async def test_chat_with_bearer_passes_auth(auth_client):
     assert resp.status_code != 401
 
 
-async def test_messages_bearer_does_not_pass_auth(auth_client):
-    """Anthropic route: Authorization: Bearer should NOT authenticate."""
+async def test_messages_bearer_also_passes_auth(auth_client):
+    """Anthropic route: Authorization: Bearer should also authenticate (dual-mode auth)."""
     config = get_config()
     password = config.auth.password
     resp = await auth_client.post(
@@ -145,11 +145,12 @@ async def test_messages_bearer_does_not_pass_auth(auth_client):
         json={"model": "test", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
         headers={"Authorization": f"Bearer {password}"},
     )
-    assert resp.status_code == 401
+    # Should NOT return 401 — dual-mode auth accepts Bearer on Anthropic route
+    assert resp.status_code != 401
 
 
-async def test_chat_x_api_key_does_not_pass_auth(auth_client):
-    """OpenAI route: x-api-key should NOT authenticate."""
+async def test_chat_x_api_key_also_passes_auth(auth_client):
+    """OpenAI route: x-api-key should also authenticate (dual-mode auth)."""
     config = get_config()
     password = config.auth.password
     resp = await auth_client.post(
@@ -157,7 +158,8 @@ async def test_chat_x_api_key_does_not_pass_auth(auth_client):
         json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
         headers={"x-api-key": password},
     )
-    assert resp.status_code == 401
+    # Should NOT return 401 — dual-mode auth accepts x-api-key on OpenAI route
+    assert resp.status_code != 401
 
 
 async def test_messages_wrong_key_returns_401(auth_client):
