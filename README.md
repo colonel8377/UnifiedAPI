@@ -120,8 +120,8 @@ pytest tests/test_stream_convert.py -v
 |---|---|
 | `test_xml_parser.py` | `<function_calls>` XML 增量解析（含 tag 跨 chunk 切分、并行 invoke、XML 实体转义、未闭合容错） |
 | `test_think_splitter.py` | `<think>...</think>` 增量剥离（含 tag 跨 chunk 切分） |
-| `test_stream_convert.py` | OpenAI SSE → Anthropic SSE 状态机（事件序列、block 切换、tool_use 增量、finish_reason 映射） |
-| `test_request_convert.py` | Anthropic → OpenAI 请求转换（system / tools 注入 / tool_use 重放 / tool_result 重放） |
+| `test_stream_convert.py` | OpenAI SSE → Anthropic SSE 状态机（事件序列、block 切换、tool_use 增量、finish_reason 映射、`length`+空内容时注入 sentinel） |
+| `test_request_convert.py` | Anthropic → OpenAI 请求转换（system / tools 注入 / tool_use 重放 / tool_result 重放 / input-aware max_tokens 计算） |
 | `test_response_convert.py` | OpenAI → Anthropic 非流式响应转换（thinking / tool_use / stop_reason） |
 | `test_rate_limiter.py` | 令牌桶（"go negative" 并发等待、per-client 隔离、全局共享） |
 | `test_concurrency.py` | AdmissionControl（全局 / per-client 并发上限、等待室满载、异常 / 取消时槽释放） |
@@ -177,8 +177,59 @@ Claude Code ──POST /v1/messages──►  FastAPI (uvicorn workers=1)
 | 没有 `X-RateLimit-*` / `Retry-After` header | 自维护令牌桶 |
 | 忽略 OpenAI `tools` 参数 | prompt 注入 XML 工具说明 |
 | `reasoning_content` 字段（思维链） | 默认丢弃；客户端 `thinking:enabled` 时转 thinking block |
+| `reasoning_content` 与 `content` 共享上游 `max_tokens` 预算 | 上游 max_tokens 加 buffer（见下「max_tokens 计算」） |
+| `stream_options: {include_usage:true}` 触发上游缓存 fast-path，永返空 usage | 不主动注入 `stream_options` |
 | `<think>...</think>` 散落在 content 里 | 增量剥离 |
 | 非流式 `created` 是字符串时间戳，流式是 int | 字段类型联合，不依赖 |
+| 上游硬上下文窗口 65535 tokens（litellm `max_total_tokens`）溢出时返 HTTP 200 + 空 SSE body | 输入感知的 max_tokens 计算（见下） |
+| 上游语义缓存对带工具的大请求不稳定 | 文档化，不绕过 |
+
+## max_tokens 计算策略
+
+上游有两个硬约束决定 max_tokens 必须动态计算，不能简单透传：
+
+1. **`reasoning_content` 与 `content` 共享预算**：探针实测（2026-06-21），一个中等数学 prompt 在上游 max_tokens=8192 时可消耗全部 8192 token 在 reasoning_content 上，导致 0 可见字符 + `finish_reason='length'`。
+2. **上游上下文窗口 65535 tokens**（litellm `max_total_tokens`）：Claude Code 典型 payload ~30k tokens 输入（28k system + 48 tools + 历史），固定乘 1.5 的 max_tokens 会和输入相加溢出 → 上游返 HTTP 200 但 SSE body 为空。
+
+`src/unified_api/converters/request.py` 的实际公式：
+
+```python
+input_chars = sum(len(m.content) for m in openai_messages) + len(json.dumps(tools_array))
+input_tokens_est = input_chars // 3       # ~3 chars/token (mixed JSON/text)
+context_budget = 65535 - input_tokens_est - 2048   # 留 2048 给 tokenizer 估算误差
+
+desired = client.max_tokens + 8192        # reasoning_content 缓冲（实测最坏 ~4k，留 2x 余量）
+upstream_max_tokens = max(16384, min(desired, context_budget))
+```
+
+**三个关键常量**：
+
+| 常量 | 值 | 来源 |
+|---|---|---|
+| `_UPSTREAM_CONTEXT` | 65535 | litellm `max_total_tokens` 实测 |
+| `_REASONING_BUFFER` | 8192 | 探针实测 reasoning_content 最坏消耗 ~4k，留 2x 余量 |
+| `_MIN_OUTPUT` | 16384 | 低于此值时 sentinel 触发率显著上升 |
+| `_SAFETY_MARGIN` | 2048 | 字符→token 估算误差缓冲 |
+
+**Claude Code 实测最坏情况**（48 tools, 85k system_chars, max_tokens=32000）：
+
+| | 输入 | 输出 | 总 | 结果 |
+|---|---|---|---|---|
+| 旧公式 `max_tokens × 1.5` | ~33k | 48000 | ~81k | 溢出 → 空 SSE |
+| 新公式 | ~33k | ~30k | ~63k | ✓ 在 65535 内 |
+
+## sentinel 兜底（`reasoning_content` 吃光预算时）
+
+即便做了上述缓冲，仍有可能（罕见）出现上游 reasoning_content 把 max_tokens 全部吃完、0 可见字符、`finish_reason='length'` 的情况。`StreamConverter.flush()`（`src/unified_api/converters/stream.py`）检测此情况并注入一段可见文本作为兜底：
+
+```
+[UnifiedAPI warning] upstream hit max_tokens during reasoning_content;
+no visible content was produced. Please retry the request.
+```
+
+这样客户端至少能看到错误，而不是收到一个空的 assistant turn（原 bug 表现：Claude Code 卡住后静默退出）。
+
+触发条件：`finish_reason == "length"` 且整个流中没有任何可见 content / tool_use delta。
 
 ## 风险与限制
 
@@ -188,6 +239,9 @@ Claude Code ──POST /v1/messages──►  FastAPI (uvicorn workers=1)
 | thinking block 无 signature | 多数客户端容忍；已默认不返回 |
 | 多 worker 会破坏限流语义 | 强制 `--workers 1`，文档明示 |
 | 工具调用依赖模型遵守 prompt 注入 | 实测稳定（6/6 场景），但理论上有幻觉风险 |
+| 长对话累积可能挤爆 65535 上游窗口 | 当前 max_tokens 公式已 input-aware；但多轮 tool_use 历史会持续增长输入。如果撞到，建议新开会话；后续可实现 history compaction |
+| `reasoning_content` 异常长可能仍吃光 max_tokens | sentinel 兜底返可见错误，客户端可重试 |
+| 上游 tengine 反向代理 ~300s 超时 | 极长请求会被网关切断，已重试也无法绕过 |
 
 ## 项目结构
 
@@ -219,4 +273,3 @@ src/unified_api/
 ## License
 
 MIT
-# UnifiedAPI
