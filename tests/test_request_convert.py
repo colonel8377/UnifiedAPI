@@ -42,7 +42,7 @@ def test_basic_user_message():
     assert len(oai.messages) == 1
     assert oai.messages[0]["role"] == "user"
     assert oai.messages[0]["content"] == "hello"
-    assert oai.max_tokens == 100
+    assert oai.max_tokens == 612  # 100 + 512 reasoning buffer
 
 
 def test_model_passthrough():

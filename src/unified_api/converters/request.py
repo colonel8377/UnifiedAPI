@@ -53,10 +53,16 @@ def convert_request(
         content = msg.get("content")
         openai_messages.append({"role": role, "content": _flatten_content(content, idx, role)})
 
+    # DeepSeek reasoning tokens share the max_tokens budget with content.
+    # Anthropic's max_tokens only counts visible output (thinking has a separate
+    # budget). Add a buffer to ensure enough tokens for content after reasoning.
+    _REASONING_BUFFER = 512
+    upstream_max_tokens = (anth_req.max_tokens or 0) + _REASONING_BUFFER
+
     payload: dict[str, Any] = {
         "model": model_name,
         "messages": openai_messages,
-        "max_tokens": anth_req.max_tokens,
+        "max_tokens": upstream_max_tokens,
     }
     if anth_req.temperature is not None:
         payload["temperature"] = anth_req.temperature
