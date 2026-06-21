@@ -62,7 +62,7 @@ models:
   # ...
 ```
 
-> ⚠️ **现状（2026-06-21）**：代码里**没有 alias 解析**，客户端 `model` 字段直接透传给上游。Claude Code 发啥就用啥（看 `/tmp/uapi_debug.jsonl` 里的 `model` 字段）。如果要切模型，直接在 Claude Code 侧设 `ANTHROPIC_MODEL=DeepSeek-V4-Pro` 或 `=DeepSeek-V4-Flash`。`_MODEL_PROFILES` dict（见下「max_tokens 计算策略」）按客户端发的模型名查表，所以两个模型都开箱可用。
+> ⚠️ **现状（2026-06-21）**：代码里**没有 alias 解析**，客户端 `model` 字段直接透传给上游。Claude Code 发啥就用啥（设 `ANTHROPIC_MODEL` 控制）。如果要切模型，直接在 Claude Code 侧设 `ANTHROPIC_MODEL=DeepSeek-V4-Pro` 或 `=DeepSeek-V4-Flash`。`_MODEL_PROFILES` dict（见下「max_tokens 计算策略」）按客户端发的模型名查表，所以两个模型都开箱可用。
 
 `${OPENAI_BASE_URL}` 和 `${OPENAI_KEY}` 在 `config.yaml` 里会自动从 `.env` 插值。
 
