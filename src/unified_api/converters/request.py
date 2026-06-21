@@ -56,7 +56,7 @@ def convert_request(
     # DeepSeek reasoning tokens share the max_tokens budget with content.
     # Anthropic's max_tokens only counts visible output (thinking has a separate
     # budget). Add a buffer to ensure enough tokens for content after reasoning.
-    _REASONING_BUFFER = 512
+    _REASONING_BUFFER = 2048
     upstream_max_tokens = (anth_req.max_tokens or 0) + _REASONING_BUFFER
 
     payload: dict[str, Any] = {
