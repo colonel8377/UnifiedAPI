@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from ..errors import ConversionError
@@ -28,6 +29,67 @@ from ..tools.prompt_builder import (
 logger = logging.getLogger(__name__)
 
 
+# --- per-model empirical profiles ---
+#
+# Each upstream model has different reasoning_content budget behavior and
+# different API-side max_tokens validation. Profiles are keyed by the
+# exact upstream model name (what the client sends in `model` field —
+# UnifiedAPI does not currently do alias resolution).
+#
+# All values are probe-verified against the HKUST upstream (2026-06-21).
+
+
+@dataclass(frozen=True)
+class ModelProfile:
+    """Empirical per-model parameters for upstream max_tokens computation.
+
+    Fields:
+        upstream_context: hard total context window (litellm max_total_tokens).
+        reasoning_buffer: tokens added to client's max_tokens to leave room
+            for reasoning_content (which shares the upstream budget).
+        min_output: floor for upstream max_tokens; below this, the model
+            spends the entire budget on reasoning_content and emits 0
+            visible chars (finish_reason='length').
+        safety_margin: chars→tokens estimation slack.
+        max_tokens_param_cap: API-side max_tokens validation cap. None means
+            the API doesn't validate (any value accepted).
+    """
+    upstream_context: int
+    reasoning_buffer: int
+    min_output: int
+    safety_margin: int = 2048
+    max_tokens_param_cap: int | None = None
+
+
+_MODEL_PROFILES: dict[str, ModelProfile] = {
+    "DeepSeek-V4-Pro": ModelProfile(
+        upstream_context=65535,        # litellm max_total_tokens (probed)
+        reasoning_buffer=8192,         # probe: ~4k worst case, 2x margin
+        min_output=16384,              # probe: 2048 fails, 16384 safe
+        max_tokens_param_cap=65535,    # litellm rejects above this with 400
+    ),
+    "DeepSeek-V4-Flash": ModelProfile(
+        upstream_context=65535,        # same litellm cap as Pro (probed)
+        reasoning_buffer=16384,        # Flash eats budget more aggressively
+        min_output=32768,              # probe: 8192 confirmed 0-content failure
+        max_tokens_param_cap=None,     # API accepts any value (tested to 500k)
+    ),
+}
+
+_DEFAULT_PROFILE = ModelProfile(
+    upstream_context=65535,
+    reasoning_buffer=8192,
+    min_output=16384,
+    safety_margin=2048,
+    max_tokens_param_cap=65535,
+)
+
+
+def get_model_profile(model_name: str) -> ModelProfile:
+    """Return the empirical profile for `model_name`, or the conservative default."""
+    return _MODEL_PROFILES.get(model_name, _DEFAULT_PROFILE)
+
+
 def convert_request(
     anth_req: AnthropicMessageRequest,
     model_name: str,
@@ -35,6 +97,7 @@ def convert_request(
     """Translate an Anthropic Messages request into an OpenAI Chat request.
 
     model_name is passed through directly to the upstream without alias mapping.
+    Per-model max_tokens handling uses get_model_profile(model_name).
     """
     openai_messages: list[dict[str, Any]] = []
 
@@ -54,38 +117,7 @@ def convert_request(
         content = msg.get("content")
         openai_messages.append({"role": role, "content": _flatten_content(content, idx, role)})
 
-    # DeepSeek reasoning_content shares the upstream max_tokens budget with
-    # visible content (probe-verified 2026-06-21: a moderate math prompt can
-    # consume the entire upstream budget on reasoning_content alone, yielding
-    # 0 visible chars + finish_reason='length'). We add a buffer so the model
-    # has room to think AND emit visible content.
-    #
-    # But the upstream context window is hard-capped at 65535 tokens
-    # (litellm max_total_tokens). Claude Code sends max_tokens=32000 with
-    # ~28k-char system prompt + 48 tools (Anthropic+XML-injected+OpenAI-format
-    # ≈ 85k chars ≈ 30k tokens of input). Old formula (max_tokens * 1.5 = 48000)
-    # + ~30k input = ~78k → overflows → upstream silently returns HTTP 200
-    # with empty SSE body. Debug instrumentation confirmed this pattern
-    # (/tmp/uapi_debug.jsonl: 4 consecutive requests with 0 chunks, 0 chars).
-    #
-    # Strategy: estimate input tokens from payload size, reserve headroom
-    # within the 65535 cap, then take the smaller of (user_request + buffer)
-    # vs (what fits), floored at 16384 (probe-verified minimum to keep
-    # reasoning_content from eating the entire budget on small prompts).
-    _REASONING_BUFFER = 8192          # probe-observed worst case (~2x margin)
-    _UPSTREAM_CONTEXT = 65535         # litellm max_total_tokens
-    _SAFETY_MARGIN = 2048             # tokenizer estimate slack
-    _MIN_OUTPUT = 16384               # floor; below this, sentinel fires too often
-
-    input_chars = sum(len(m.get("content") or "") for m in openai_messages)
-    if anth_req.tools:
-        # Account for tools array sent in OpenAI format alongside the XML prompt
-        input_chars += len(json.dumps(_convert_tools_to_openai(anth_req.tools)))
-    input_tokens_est = input_chars // 3   # ~3 chars/token for mixed JSON/text
-    context_budget = _UPSTREAM_CONTEXT - input_tokens_est - _SAFETY_MARGIN
-
-    desired = (anth_req.max_tokens or 0) + _REASONING_BUFFER
-    upstream_max_tokens = max(_MIN_OUTPUT, min(desired, context_budget))
+    upstream_max_tokens = _compute_upstream_max_tokens(anth_req, model_name, openai_messages)
 
     payload: dict[str, Any] = {
         "model": model_name,
@@ -112,6 +144,45 @@ def convert_request(
             payload["tool_choice"] = oai_choice
 
     return OpenAIChatRequest(**payload)
+
+
+def _compute_upstream_max_tokens(
+    anth_req: AnthropicMessageRequest,
+    model_name: str,
+    openai_messages: list[dict[str, Any]],
+) -> int:
+    """Pick upstream max_tokens using the per-model profile.
+
+    Two competing constraints:
+      1. reasoning_content shares the upstream budget with visible content
+         → add `reasoning_buffer` so model has room to think AND emit text.
+      2. upstream total context window is hard-capped (`upstream_context`)
+         → cap output so input + output <= upstream_context - safety_margin.
+
+    Probe evidence (2026-06-21):
+      - V4-Pro with max_tokens=2048, math prompt: 0 visible chars, finish=length.
+      - V4-Pro with 85k-char system + max_tokens=48000: HTTP 200 + empty SSE
+        (silent overflow, fixed by context-aware cap).
+      - Flash with max_tokens=8192, math prompt: same 0-chars+length failure.
+      - Flash accepts max_tokens=500000 without API error, but actual generation
+        still bounded by upstream_context - input.
+    """
+    profile = get_model_profile(model_name)
+
+    input_chars = sum(len(m.get("content") or "") for m in openai_messages)
+    if anth_req.tools:
+        # Tools are also sent in OpenAI format alongside the injected XML prompt
+        input_chars += len(json.dumps(_convert_tools_to_openai(anth_req.tools)))
+    input_tokens_est = input_chars // 3   # ~3 chars/token for mixed JSON/text
+    context_budget = profile.upstream_context - input_tokens_est - profile.safety_margin
+
+    desired = (anth_req.max_tokens or 0) + profile.reasoning_buffer
+    upstream_max_tokens = max(profile.min_output, min(desired, context_budget))
+
+    if profile.max_tokens_param_cap is not None:
+        upstream_max_tokens = min(upstream_max_tokens, profile.max_tokens_param_cap)
+
+    return upstream_max_tokens
 
 
 def _flatten_system(system: str | list[dict[str, Any]]) -> str:

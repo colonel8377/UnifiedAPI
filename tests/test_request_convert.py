@@ -42,8 +42,8 @@ def test_basic_user_message():
     assert len(oai.messages) == 1
     assert oai.messages[0]["role"] == "user"
     assert oai.messages[0]["content"] == "hello"
-    # Buffer = max(int(max_tokens * 1.5), 16384); with max_tokens=100 the
-    # floor kicks in → 16384 (reasoning_content eats the upstream budget).
+    # V4-Pro profile: max_tokens=100 + buffer 8192 = 8292, below floor 16384
+    # → floor kicks in → 16384.
     assert oai.max_tokens == 16384
 
 
@@ -320,3 +320,83 @@ def test_multiple_tools_converted():
     assert len(dumped["tools"]) == 2
     names = [t["function"]["name"] for t in dumped["tools"]]
     assert names == ["a", "b"]
+
+
+# --- per-model profile selection ---
+
+
+FLASH_MODEL = "DeepSeek-V4-Flash"
+
+
+def test_flash_profile_uses_higher_floor_than_pro():
+    """Flash's probe-verified failure at max_tokens=8192 forces a higher
+    floor (32768) than V4-Pro (16384). Same tiny request → different result."""
+    req = _make_req(model=FLASH_MODEL, messages=[{"role": "user", "content": "hi"}])
+    oai_pro = convert_request(_make_req(messages=[{"role": "user", "content": "hi"}]),
+                              UPSTREAM_MODEL)
+    oai_flash = convert_request(req, FLASH_MODEL)
+    assert oai_pro.max_tokens == 16384     # Pro floor
+    assert oai_flash.max_tokens == 32768   # Flash floor
+
+
+def test_flash_profile_uses_higher_reasoning_buffer():
+    """Flash eats budget more aggressively → larger buffer."""
+    # max_tokens=16384 + buffer. Pro: 16384+8192=24576. Flash: 16384+16384=32768.
+    req_pro = _make_req(max_tokens=16384, messages=[{"role": "user", "content": "hi"}])
+    req_flash = _make_req(model=FLASH_MODEL, max_tokens=16384,
+                          messages=[{"role": "user", "content": "hi"}])
+    assert convert_request(req_pro, UPSTREAM_MODEL).max_tokens == 24576
+    assert convert_request(req_flash, FLASH_MODEL).max_tokens == 32768
+
+
+def test_unknown_model_falls_back_to_default_profile():
+    """Unknown model names get the conservative default (same as V4-Pro)."""
+    req = _make_req(model="Some-Future-Model",
+                    messages=[{"role": "user", "content": "hi"}])
+    oai = convert_request(req, "Some-Future-Model")
+    # Default profile: floor=16384, buffer=8192 → max_tokens=100 yields 16384
+    assert oai.max_tokens == 16384
+
+
+def test_flash_context_overflow_still_capped():
+    """Flash has no max_tokens_param_cap, but context_budget still applies.
+    Large input → max_tokens still gets capped to fit upstream_context."""
+    big_system = "x" * 85_000
+    many_tools = [
+        {"name": f"tool_{i}", "description": "d" * 200,
+         "input_schema": {"type": "object", "properties": {"p": {"type": "string"}}}}
+        for i in range(48)
+    ]
+    req = _make_req(model=FLASH_MODEL, max_tokens=32000,
+                    system=big_system, tools=many_tools)
+    oai = convert_request(req, FLASH_MODEL)
+    # Must be capped well below what 32000 + 16384 buffer would give
+    assert oai.max_tokens < 32000 + 16384
+    # Must still be above Flash's higher floor (32k)
+    assert oai.max_tokens >= 32768
+    # Must fit in upstream_context
+    assert oai.max_tokens < 65535
+
+
+def test_pro_max_tokens_param_cap_respected():
+    """V4-Pro's litellm rejects max_tokens > 65535. Even with tiny input and
+    huge client request, output must stay under the cap."""
+    # Huge client request + tiny input → desired would be 100000 + 8192 = 108192
+    # But V4-Pro profile caps max_tokens param at 65535.
+    req = _make_req(max_tokens=100000,
+                    messages=[{"role": "user", "content": "hi"}])
+    oai = convert_request(req, UPSTREAM_MODEL)
+    assert oai.max_tokens <= 65535
+
+
+def test_flash_no_max_tokens_param_cap():
+    """Flash API doesn't validate max_tokens param. With tiny input and huge
+    client request, output is bounded only by context_budget, not param cap."""
+    req = _make_req(model=FLASH_MODEL, max_tokens=100000,
+                    messages=[{"role": "user", "content": "hi"}])
+    oai = convert_request(req, FLASH_MODEL)
+    # Tiny input → context_budget ≈ 65535 - 0 - 2048 = 63487
+    # desired = 100000 + 16384 = 116384, capped by context_budget
+    # No param_cap on Flash, so result = max(32768, min(116384, 63487)) = 63487
+    assert 60000 < oai.max_tokens <= 65535
+    assert oai.max_tokens > 32768   # above floor

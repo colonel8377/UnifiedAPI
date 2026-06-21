@@ -52,21 +52,17 @@ OPENAI_MODEL=DeepSeek-V4-Pro
 | `thinking.return_when_client_enables` | 客户端发 `thinking:enabled` 时是否返回 | `true` |
 | `models` | alias → upstream_model 映射列表 | 见下 |
 
-模型路由示例：
+模型路由示例（**未实现，仅展望**）：
 
 ```yaml
 models:
   - alias: claude-sonnet-4-5
     upstream_model: DeepSeek-V4-Pro
     max_tokens_default: 8192
-  - alias: claude-opus-4-6
-    upstream_model: DeepSeek-V4-Pro
-    max_tokens_default: 16384
-  - alias: claude-haiku-4-5
-    upstream_model: DeepSeek-V4-Pro
-    max_tokens_default: 4096
-  # 用户可自由加自定义 alias
+  # ...
 ```
+
+> ⚠️ **现状（2026-06-21）**：代码里**没有 alias 解析**，客户端 `model` 字段直接透传给上游。Claude Code 发啥就用啥（看 `/tmp/uapi_debug.jsonl` 里的 `model` 字段）。如果要切模型，直接在 Claude Code 侧设 `ANTHROPIC_MODEL=DeepSeek-V4-Pro` 或 `=DeepSeek-V4-Flash`。`_MODEL_PROFILES` dict（见下「max_tokens 计算策略」）按客户端发的模型名查表，所以两个模型都开箱可用。
 
 `${OPENAI_BASE_URL}` 和 `${OPENAI_KEY}` 在 `config.yaml` 里会自动从 `.env` 插值。
 
@@ -83,6 +79,7 @@ uvicorn unified_api.main:app --host 0.0.0.0 --port 8000 --workers 1
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=any-string   # 我们透传，不校验内容
+export ANTHROPIC_MODEL=DeepSeek-V4-Pro   # 或 DeepSeek-V4-Flash
 claude
 ```
 
@@ -191,32 +188,47 @@ Claude Code ──POST /v1/messages──►  FastAPI (uvicorn workers=1)
 1. **`reasoning_content` 与 `content` 共享预算**：探针实测（2026-06-21），一个中等数学 prompt 在上游 max_tokens=8192 时可消耗全部 8192 token 在 reasoning_content 上，导致 0 可见字符 + `finish_reason='length'`。
 2. **上游上下文窗口 65535 tokens**（litellm `max_total_tokens`）：Claude Code 典型 payload ~30k tokens 输入（28k system + 48 tools + 历史），固定乘 1.5 的 max_tokens 会和输入相加溢出 → 上游返 HTTP 200 但 SSE body 为空。
 
-`src/unified_api/converters/request.py` 的实际公式：
+### Per-model profile
+
+不同模型行为不同，所以 max_tokens 公式按模型查表。Profile 在 `src/unified_api/converters/request.py` 的 `_MODEL_PROFILES` dict 里（探针实测数据，不放 config.yaml —— 模型行为不该让运维改 yaml 就上线）。
+
+| 模型 | `upstream_context` | `reasoning_buffer` | `min_output` | `max_tokens_param_cap` |
+|---|---|---|---|---|
+| `DeepSeek-V4-Pro` | 65535 | 8192 | 16384 | 65535（litellm 强制） |
+| `DeepSeek-V4-Flash` | 65535 | **16384** | **32768** | **None**（API 不校验） |
+| 其他（默认） | 65535 | 8192 | 16384 | 65535 |
+
+**为什么 Flash 的 buffer/floor 更大**：探针实测 Flash 在 max_tokens=8192 时就翻车（0 content + finish=length），比 V4-Pro 更激进。V4-Pro 在 8192 时不一定翻车，2048 才翻。
+
+**为什么 Flash 的 param_cap 是 None**：Flash API 层不校验 max_tokens 值（实测 500000 都接受），实际生成仍受 `upstream_context - input` 限制。
+
+### 公式
 
 ```python
+profile = get_model_profile(model_name)
+
 input_chars = sum(len(m.content) for m in openai_messages) + len(json.dumps(tools_array))
 input_tokens_est = input_chars // 3       # ~3 chars/token (mixed JSON/text)
-context_budget = 65535 - input_tokens_est - 2048   # 留 2048 给 tokenizer 估算误差
+context_budget = profile.upstream_context - input_tokens_est - profile.safety_margin
 
-desired = client.max_tokens + 8192        # reasoning_content 缓冲（实测最坏 ~4k，留 2x 余量）
-upstream_max_tokens = max(16384, min(desired, context_budget))
+desired = client.max_tokens + profile.reasoning_buffer
+upstream_max_tokens = max(profile.min_output, min(desired, context_budget))
+if profile.max_tokens_param_cap is not None:
+    upstream_max_tokens = min(upstream_max_tokens, profile.max_tokens_param_cap)
 ```
 
-**三个关键常量**：
+### 加新模型
 
-| 常量 | 值 | 来源 |
-|---|---|---|
-| `_UPSTREAM_CONTEXT` | 65535 | litellm `max_total_tokens` 实测 |
-| `_REASONING_BUFFER` | 8192 | 探针实测 reasoning_content 最坏消耗 ~4k，留 2x 余量 |
-| `_MIN_OUTPUT` | 16384 | 低于此值时 sentinel 触发率显著上升 |
-| `_SAFETY_MARGIN` | 2048 | 字符→token 估算误差缓冲 |
+1. 跑探针测四个参数（参考 `/tmp/probe_flash_*.py`），不要套别的模型的参数
+2. 在 `_MODEL_PROFILES` dict 加一行
+3. 在 `tests/test_request_convert.py` 加专属测试（floor、buffer、cap）
 
 **Claude Code 实测最坏情况**（48 tools, 85k system_chars, max_tokens=32000）：
 
 | | 输入 | 输出 | 总 | 结果 |
 |---|---|---|---|---|
 | 旧公式 `max_tokens × 1.5` | ~33k | 48000 | ~81k | 溢出 → 空 SSE |
-| 新公式 | ~33k | ~30k | ~63k | ✓ 在 65535 内 |
+| 新公式（V4-Pro profile） | ~33k | ~30k | ~63k | ✓ 在 65535 内 |
 
 ## sentinel 兜底（`reasoning_content` 吃光预算时）
 
